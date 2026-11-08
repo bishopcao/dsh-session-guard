@@ -2,6 +2,25 @@
 
 All notable changes to this project.
 
+## [1.0.1] — 2026-11-09
+
+### Fixed — a missing client slot killed the entire plugin
+
+All five ctx.slots.inject calls except two were unwrapped. If the host did
+not provide a slot, the throw aborted the whole actory, so the slots after
+it never registered either — a build missing one slot silently lost several UI
+pieces. Each slot now registers through mountSlot(), which catches and logs
+per slot.
+
+Verified with a simulated host offering 5, 4, 2 and 0 slots: the module never
+throws, and every available slot still registers.
+
+### Added — Compatibility section in the README
+
+Records the tested DSH version, states plainly that ngines.dsh is the
+version actually run rather than a verified lower bound, and tables what UI
+each missing slot costs.
+
 ## [1.0.0] — 2026-11-09
 
 First release. The three fixes below were found by a release audit and are the

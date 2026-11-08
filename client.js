@@ -1491,8 +1491,30 @@ window.__ModuleLoader__.load({
         //   · 挂上之后不再做任何 DOM 写入，除非用户点按钮
         try { installSidebarFold() } catch { /* ignore */ }
 
+        // ---------- 插槽注册 ----------
+        //
+        // 每个插槽单独包 try：宿主版本不同，插槽可能整个不存在。
+        // 实测（_slot.mjs）：一次 inject 抛异常会中断整个 factory，
+        // 后面的插槽全都注册不上——所以不能裸调，也不能只包一组。
+        //
+        // 缺哪个就少哪块 UI，其余照常工作：
+        //   缺 plugins.bundle.config          → 没有插件卡片
+        //   缺 conversation.session.header     → 没有会话头部徽标
+        //   缺 sidebar...session.menu.item     → 会话菜单没有「删除」项
+        //   缺 sidebar.panellist / main        → 没有侧边栏面板
+        // Host 侧的 /session-guard 接口和两个工具不受影响。
+        const mountSlot = (name, fn) => {
+          try {
+            ctx.slots.inject(name, fn)
+          } catch (error) {
+            try {
+              console.warn(`[dsh-session-guard] 插槽 ${name} 不可用，跳过该区块：`, String(error?.message ?? error))
+            } catch { /* ignore */ }
+          }
+        }
+
         // 插件管理页卡片
-        ctx.slots.inject('plugins.bundle.config', function* () {
+        mountSlot('plugins.bundle.config', function* () {
           yield ctx.slots.register(
             { name: 'plugins.bundle.config', key: 'dsh-session-guard' },
             BundleCard,
@@ -1500,7 +1522,7 @@ window.__ModuleLoader__.load({
         })
 
         // 会话头部徽标
-        ctx.slots.inject('conversation.session.header.utilities', function* () {
+        mountSlot('conversation.session.header.utilities', function* () {
           yield ctx.slots.register(
             { name: 'conversation.session.header.utilities', id: 'session-guard-badge', order: -3 },
             HeaderBadge,
@@ -1509,38 +1531,28 @@ window.__ModuleLoader__.load({
 
         // 侧边栏会话菜单：加一条「删除会话」
         // 这个插槽是 DSH 官方开放的扩展点，会传入 { sessionId, displayTitle }。
-        // 整体包在 try 里：即使宿主版本不认这个插槽，也不能把另外两个区块一起拖垮。
-        try {
-          ctx.slots.inject('sidebar.workspaces.session.menu.item', function* () {
-            yield ctx.slots.register(
-              { name: 'sidebar.workspaces.session.menu.item', id: 'session-guard-delete', order: 100 },
-              DeleteSessionMenuItem,
-            )
-          })
-        } catch (error) {
-          try { console.warn('[dsh-session-guard] 会话菜单插槽注册失败：', error) } catch { /* ignore */ }
-        }
+        mountSlot('sidebar.workspaces.session.menu.item', function* () {
+          yield ctx.slots.register(
+            { name: 'sidebar.workspaces.session.menu.item', id: 'session-guard-delete', order: 100 },
+            DeleteSessionMenuItem,
+          )
+        })
 
         // 侧边栏面板：把整套界面搬到左侧栏
         //   sidebar.panellist → 左侧栏一个图标
         //   main              → 点开后接管中央面板
-        // 两个都必须成功，缺一个就没意义，所以一起放 try 里。
-        try {
-          ctx.slots.inject('sidebar.panellist', function* () {
-            yield ctx.slots.register(
-              { name: 'sidebar.panellist', id: 'session-guard', order: 36, label: '会话守护' },
-              GuardSidebarIcon,
-            )
-          })
-          ctx.slots.inject('main', function* () {
-            yield ctx.slots.register(
-              { name: 'main', key: 'session-guard' },
-              GuardMainPanel,
-            )
-          })
-        } catch (error) {
-          try { console.warn('[dsh-session-guard] 侧边栏面板注册失败：', error) } catch { /* ignore */ }
-        }
+        mountSlot('sidebar.panellist', function* () {
+          yield ctx.slots.register(
+            { name: 'sidebar.panellist', id: 'session-guard', order: 36, label: '会话守护' },
+            GuardSidebarIcon,
+          )
+        })
+        mountSlot('main', function* () {
+          yield ctx.slots.register(
+            { name: 'main', key: 'session-guard' },
+            GuardMainPanel,
+          )
+        })
       },
     }
   },

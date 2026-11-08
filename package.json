@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-guard",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Stops DSH conversations from being cascade-deleted with their parent topic, keeps an incremental local backup, and lets you delete or restore sessions safely.",
   "type": "module",
   "engines": {

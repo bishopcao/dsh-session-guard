@@ -44,12 +44,40 @@ Or add it to `~/.dsh/profiles/<profile>/package.json`:
 
 ```json
 {
-  "dependencies": { "dsh-session-guard": "1.0.0" },
+  "dependencies": { "dsh-session-guard": "1.0.1" },
   "dsh": { "profile": { "bundles": ["dsh-session-guard"] } }
 }
 ```
 
 Restart DSH afterwards.
+
+## Compatibility
+
+**Tested against: DSH `0.2.1-rc.2`, Node `^22.19.0` / `>=24.0.0`.**
+
+`package.json` declares `engines.dsh: ">=0.2.1-rc.2"` — that is the version this
+was actually run on, not a verified lower bound. Older builds may work, but
+they have not been tested.
+
+DSH plugins depend on extension points that can appear, disappear, or change
+props between releases. This plugin uses five client slots, and **each one is
+registered independently inside its own `try`**, so a missing slot costs one
+piece of UI rather than the whole plugin:
+
+| Missing slot | What you lose |
+|---|---|
+| `plugins.bundle.config` | the plugin card |
+| `conversation.session.header.utilities` | the conversation-header badge |
+| `sidebar.workspaces.session.menu.item` | 「删除会话」 in the session menu |
+| `sidebar.panellist` / `main` | the sidebar panel |
+
+The Host side (the two tools, `/session-guard/*`, backup and detach logic) is
+unaffected by client-slot availability and keeps working either way.
+
+The session file layout is `sessions/<project>/<session-id>/session.v4.jsonl.zstd`.
+The `v4` in that name is the format version; if a DSH release changes it,
+`scanSessions()` will report those sessions as unreadable in **数据体检**
+(Data audit) instead of silently misbehaving.
 
 ## Configuration
 
