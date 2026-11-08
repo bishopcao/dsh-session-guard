@@ -899,20 +899,22 @@ function applyInner(ctx, config) {
               return liveIds.has(p)          // 父会话还活着 → 归入父会话
             }
 
+            // 先算出「该显示的全部条目」（已排除归入父会话的子代理）。
+            // 两个标签页的计数必须都从这一份算，不能从过滤后的 items 算——
+            // 否则切到「现存」时 items 里只有 alive 的，已删除数就成了 0，
+            // 表现为「点哪个哪个才有数字」。
+            const visible = allItems.filter((b) => !buriedSubagent(b.id))
+            const deletedCount = visible.filter((b) => !b.alive).length
+            const aliveCount = visible.filter((b) => b.alive).length
+            const hiddenSubagentCount = allItems.filter((b) => buriedSubagent(b.id)).length
+
             // 按 alive 过滤：deleted = 会话已不在磁盘（可恢复），alive = 会话还在
             const filter = url.searchParams.get('filter') || 'all'
             let items = filter === 'deleted'
-              ? allItems.filter((b) => !b.alive)
+              ? visible.filter((b) => !b.alive)
               : filter === 'alive'
-                ? allItems.filter((b) => b.alive)
-                : allItems
-
-            // 隐藏「已归入父会话」的子代理；孤儿保留（用户需要看到并清理它们）
-            items = items.filter((b) => !buriedSubagent(b.id))
-
-            const deletedCount = items.filter((b) => !b.alive).length
-            const aliveCount = items.filter((b) => b.alive).length
-            const hiddenSubagentCount = allItems.filter((b) => buriedSubagent(b.id)).length
+                ? visible.filter((b) => b.alive)
+                : visible
 
             // 服务端分页：前端要翻页，不能只给前 N 条
             const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200))
