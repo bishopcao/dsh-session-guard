@@ -1,0 +1,23 @@
+# Build artifacts and local backups
+*.bak
+*.bak-*
+*.js.bak*
+*.mjs.bak*
+*.tmp
+*.log
+
+# Dependencies
+node_modules/
+pnpm-lock.yaml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local test scratch
+_test/
+scratch/
+_test-*.mjs
+_*.mjs

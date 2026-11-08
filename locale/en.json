@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Session Guard",
+    "description": "Detaches forked conversations from their parent the moment a branch is created, so deleting a parent topic can never take its children with it."
+  }
+}

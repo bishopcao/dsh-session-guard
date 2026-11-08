@@ -1,0 +1,33 @@
+# dsh-session-guard bundle layer
+#
+# 问题：DSH 归档插件删父话题时会把它的全部后代一起物理删除
+#       （@linxin666/dsh-session-archive 的 cascade，rmSync 直删、不进回收站）。
+#
+# 本插件做两件事：
+#   1. 预防 —— 清空真实对话的 parentSession，让父子关系不产生，
+#              删父话题时在数据结构上就找不到"后代"。
+#   2. 补救 —— 在 ~/.dsh/session-guard-backup/ 留一份增量副本，
+#              万一被删（包括被别的途径删），仍能按 id 还原。
+#
+# 工具：dsh_session_lineage（查看关系，只读）
+#       dsh_detach_sessions（解除，默认预演，confirm=true 才写）
+#
+# `name` 必须是 loader 能从 profile 的 node_modules 解析到的**包名**，不是路径。
+- insert:
+    - id: session-guard
+      name: dsh-session-guard
+      config:
+        # 启动时自动解除真实对话的父子关系。
+        # true（默认）：DSH 一启动就扫一遍并直接解除，不需要任何人工操作。
+        # false：只打警告不改数据，需要时手动调用 dsh_detach_sessions。
+        autoDetachOnMount: true
+
+        # 启动时做一次增量备份（误删恢复的前提）。
+        # true（默认）：把当前所有会话留一份副本；第二次启动只复制变化的文件。
+        # false：不备份，/restorable 会是空的，也就没有恢复能力。
+        backupOnMount: true
+
+        # 备份保留天数。超过这个天数的备份会在启动时自动清理。
+        # 只清理「会话已经不存在」的备份；还活着的会话不会因为过期被删。
+        # 0 = 永不自动清理。
+        backupRetentionDays: 30

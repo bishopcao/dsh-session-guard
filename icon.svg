@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Session guard">
+  <defs>
+    <linearGradient id="sg-a" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#3b82f6"/>
+      <stop offset="1" stop-color="#1d4ed8"/>
+    </linearGradient>
+  </defs>
+  <!-- 盾牌底 -->
+  <path d="M32 6 L54 15 v18 c0 13-9 22-22 27 C19 55 10 46 10 33 V15 Z"
+        fill="url(#sg-a)" opacity="0.16"/>
+  <path d="M32 6 L54 15 v18 c0 13-9 22-22 27 C19 55 10 46 10 33 V15 Z"
+        fill="none" stroke="url(#sg-a)" stroke-width="2.5" stroke-linejoin="round"/>
+  <!-- 分离中的两个节点：左父右子，中间断开 -->
+  <circle cx="25" cy="29" r="4.5" fill="none" stroke="url(#sg-a)" stroke-width="2.5"/>
+  <circle cx="39" cy="29" r="4.5" fill="none" stroke="url(#sg-a)" stroke-width="2.5"/>
+  <!-- 断开的连接 -->
+  <line x1="29.5" y1="29" x2="31.5" y2="29" stroke="url(#sg-a)" stroke-width="2.5" stroke-linecap="round"/>
+  <line x1="36.5" y1="29" x2="34.5" y2="29" stroke="url(#sg-a)" stroke-width="2.5" stroke-linecap="round"/>
+  <!-- 下方“已独立”的对勾 -->
+  <path d="M25 42 L30 47 L41 36" fill="none" stroke="url(#sg-a)"
+        stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
