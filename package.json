@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-guard",
-  "version": "1.0.1",
-  "description": "Stops DSH conversations from being cascade-deleted with their parent topic, keeps an incremental local backup, and lets you delete or restore sessions safely.",
+  "version": "1.0.2",
+  "description": "防止 DSH 删除父话题时连带删掉子会话；保留增量本地备份，可安全删除与恢复会话。",
   "type": "module",
   "engines": {
     "dsh": ">=0.2.1-rc.2",
@@ -51,7 +51,11 @@
     "archive",
     "backup",
     "restore",
-    "cascade-delete"
+    "cascade-delete",
+    "会话守护",
+    "会话备份",
+    "误删恢复",
+    "会话管理"
   ],
   "dsh": {
     "engines": {

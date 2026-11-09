@@ -2,6 +2,13 @@
 
 All notable changes to this project.
 
+## [1.0.2] — 2026-11-09
+
+### Changed — 文档改为中文为主
+
+README 全篇重写为中文，package.json 的 description 与 keywords 也加了中文，
+便于中文环境检索。代码标识符、命令、接口路径保持原文。
+
 ## [1.0.1] — 2026-11-09
 
 ### Fixed — a missing client slot killed the entire plugin
