@@ -12,8 +12,22 @@
 //   2. 拒绝删除空 id / 找不到的 id
 //   3. **先**把文件复制进备份区并校验字节数
 //   4. 校验失败 → 中止，一个字节都不删
-//   5. 校验通过 → 再删目录
-//   6. 删除后写一条记录，说明「这个会话是被本插件删的，可从备份恢复」
+//   5. **再从 DSH 的列表状态里摘掉**（归档语义，见下）
+//   6. 最后删目录
+//   7. 写一条记录，说明「这个会话是被本插件删的，可从备份恢复」
+//
+// 为什么第 5 步必须在第 6 步之前
+// ------------------------------
+// DSH 的侧边栏列表读的是 Host 内存里的会话快照，不是磁盘。
+// 直接 rmSync 会让「磁盘已删、Host 仍认为活着」——界面上删不掉，
+// 而且给那个会话发消息会 ENOENT（Host 去开一个不存在的文件）。
+//
+// 正确的做法是走 DSH 自己的归档通道：workspaceRegistry.archiveSession(id)
+// 把 id 写进 archivedSessionIds 并持久化，列表立刻过滤掉它。
+// 但 archiveSession 内部会校验「这个会话还在」，
+// 所以归档必须发生物理删除**之前**，否则会抛 WorkspaceUnknownSessionError。
+//
+// 归档失败就中止删除——宁可删不掉，也不留下 Host 与磁盘不一致的烂摊子。
 //
 // 任何一步失败都返回 status + reason，不抛异常。
 
@@ -42,10 +56,11 @@ function isBusy(file) {
  * @param {{id:string, dir:string, file:string}} session scanSessions() 的元素
  * @param {object} deps 依赖注入（避免循环 import）
  * @param {(id:string) => boolean} deps.ensureBackup 备份这个会话，返回是否成功
+ * @param {(id:string) => Promise<void>} [deps.archive] 把会话从 DSH 列表状态里摘掉
  * @param {{dryRun?:boolean}} [options]
- * @returns {{status:'deleted'|'planned'|'busy'|'failed'|'missing'|'backup-failed', id?:string, reason?:string, freedBytes?:number}}
+ * @returns {Promise<{status:'deleted'|'planned'|'busy'|'failed'|'missing'|'backup-failed'|'archive-failed', id?:string, reason?:string, freedBytes?:number}>}
  */
-export function deleteSession(session, deps, options = {}) {
+export async function deleteSession(session, deps, options = {}) {
   try {
     const id = session?.header?.id ?? session?.id
     if (typeof id !== 'string' || !id) return { status: 'failed', reason: 'bad-id' }
@@ -81,7 +96,24 @@ export function deleteSession(session, deps, options = {}) {
       if (!ok) return { status: 'backup-failed', id, reason: '备份失败，已中止删除' }
     }
 
-    // 3. 再删
+    // 3. 从 DSH 列表状态里摘掉（归档语义），必须在物理删除之前
+    //
+    //    注意 deps.archive 是可选的：老调用方（或 workspaceRegistry 不可用的
+    //    环境）会传 undefined，此时退化为「只删文件」，列表要重启才更新。
+    //    但只要传了，就必须成功——失败就中止，不留不一致状态。
+    if (typeof deps?.archive === 'function') {
+      try {
+        await deps.archive(id)
+      } catch (error) {
+        return {
+          status: 'archive-failed',
+          id,
+          reason: `无法从 DSH 列表中移除（${String(error?.message ?? error)}），已中止删除`,
+        }
+      }
+    }
+
+    // 4. 再删
     rmSync(dir, { recursive: true, force: false })
     if (existsSync(dir)) return { status: 'failed', id, reason: '删除后目录仍存在' }
 
@@ -97,11 +129,17 @@ export function deleteSession(session, deps, options = {}) {
  * @param {Array} sessions
  * @param {object} deps 同 deleteSession
  * @param {{dryRun?:boolean}} [options]
- * @returns {{results:Array, deleted:number, planned:number, busy:number, failed:number, freedBytes:number}}
+ * @returns {Promise<{results:Array, deleted:number, planned:number, busy:number, failed:number, freedBytes:number}>}
  */
-export function deleteSessions(sessions, deps, options = {}) {
+export async function deleteSessions(sessions, deps, options = {}) {
   const list = Array.isArray(sessions) ? sessions : []
-  const results = list.map((s) => deleteSession(s, deps, options))
+  // 串行删除：归档走 workspaceRegistry 的 operationTail 队列，
+  // 并发提交会被排队，而且顺序混乱时不易定位失败原因。
+  const results = []
+  for (const s of list) {
+    // eslint-disable-next-line no-await-in-loop
+    results.push(await deleteSession(s, deps, options))
+  }
   let deleted = 0, planned = 0, busy = 0, failed = 0, freedBytes = 0
   for (const r of results) {
     if (r.status === 'deleted') { deleted++; freedBytes += r.freedBytes ?? 0 }
@@ -170,7 +208,7 @@ export function descendantsOf(allSessions, rootIds) {
  * @param {object} deps 同 deleteSession
  * @param {{dryRun?:boolean, cascade?:boolean}} [options] cascade 默认 true
  */
-export function deleteSessionsCascade(roots, allSessions, deps, options = {}) {
+export async function deleteSessionsCascade(roots, allSessions, deps, options = {}) {
   const list = Array.isArray(roots) ? roots : []
   const cascade = options?.cascade !== false
   const dryRun = options?.dryRun === true
@@ -200,13 +238,14 @@ export function deleteSessionsCascade(roots, allSessions, deps, options = {}) {
   // 最后追加根（它最深，放最后删）
   const all = [...ordered, ...list]
 
-  // 复用 deleteSessions 的逐个删除，但结果要能区分「根」和「连带子会话」
+  // 复用 deleteSession 的逐个删除，但结果要能区分「根」和「连带子会话」
   const rootIdSet = new Set(list.map((s) => s?.header?.id).filter(Boolean))
-  const results = all.map((s) => {
-    const id = s?.header?.id
-    const r = deleteSession(s, deps, { dryRun })
-    return { ...r, isCascade: !rootIdSet.has(id) }
-  })
+  const results = []
+  for (const s of all) {
+    // eslint-disable-next-line no-await-in-loop
+    const r = await deleteSession(s, deps, { dryRun })
+    results.push({ ...r, isCascade: !rootIdSet.has(s?.header?.id) })
+  }
 
   let deleted = 0, planned = 0, busy = 0, failed = 0, freedBytes = 0
   let cascadeDeleted = 0

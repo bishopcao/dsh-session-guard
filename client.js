@@ -33,6 +33,10 @@ window.__ModuleLoader__.load({
     // 同样容错：拿不到就退化为「下次刷新生效」。
     let sessionsApi = null
 
+    // uiWorkspace 服务（用来在删掉当前会话后把主面板切走）。
+    // 拿不到就退化为「面板停在原处，点别的会话才消失」。
+    let uiWorkspaceApi = null
+
     const BASE = '/session-guard'
 
     // ---------- 侧边栏图标区的折叠开关 ----------
@@ -452,6 +456,149 @@ window.__ModuleLoader__.load({
       return res.json()
     }
 
+    // 让侧边栏把已删的会话从列表里去掉。
+    //
+    // 为什么必须有：本插件直接改文件系统，绕过了 Host 的会话服务，
+    // 所以侧边栏的 sessions.list 还停留在删之前的快照。不主动通知的话，
+    // 被删掉的会话会一直挂在列表上，用户以为「删除没生效」。
+    //
+    // 两种手段，按代价从小到大尝试：
+    //   ① handleSessionRemoved(id) —— 官方收到 api-session/removed 事件时
+    //      调的是同一个函数（dsh-api-session-controller/lib/types/client/index.js:28）。
+    //      它只改本地快照，不重新拉列表，几百个会话也是瞬间完成。
+    //   ② refresh() —— 重新向 Host 拉整个列表（service.js:253
+    //      refresh() { return this.manager.refreshList() }），慢但更彻底。
+    //
+    // 优先 ①：删一个就用 ①，界面立刻变；①失败再退到 ②。
+    async function guardForgetSession(sessionId) {
+      const svc = sessionsApi
+      if (!svc) return false
+
+      // ① 本地移除（首选）
+      if (sessionId) {
+        try {
+          if (typeof svc.handleSessionRemoved === 'function') {
+            svc.handleSessionRemoved(sessionId)
+            return true
+          }
+        } catch (e) {
+          try { console.warn('[dsh-session-guard] handleSessionRemoved 失败，改用 refresh：', e) } catch { /* ignore */ }
+        }
+      }
+
+      // ② 重新拉列表（兜底）
+      try {
+        if (typeof svc.refresh === 'function') { await svc.refresh(); return true }
+      } catch { /* ignore */ }
+      try {
+        if (svc.list && typeof svc.list.refresh === 'function') { await svc.list.refresh(); return true }
+      } catch { /* ignore */ }
+      return false
+    }
+
+    // 如果被删的正是主面板当前显示的会话，就切到另一个会话。
+    //
+    // 为什么需要：侧边栏摘掉之后，中央面板还停在已删的会话上。
+    // 因为主面板用 `retainedBy.mainView` 这个**引用计数**持有会话
+    // （dsh-api-session-controller/lib/types/client/sessions/service.js:415 retainScope），
+    // 引用握在 UI 组件里，只有组件卸载或切换会话时才 release。
+    // 服务层没有强制释放的公开接口（查过 retireScope / forceRelease 都不对外），
+    // 所以唯一干净的路子是主动调用官方的 uiWorkspace.openSession(别的会话)，
+    // 让旧引用随切换自然释放。
+    //
+    // 判断「是不是当前会话」也走官方口径：retainedBy.mainView > 0。
+    // 这个字段就是 dsh-client-ui-session/lib/client.js:917 判断主视图的依据。
+    function switchAwayIfViewing(sessionId) {
+      const svc = sessionsApi
+      // 把每一步的判断结果写进宿主日志（POST /diag），
+      // 这样即使浏览器控制台看不到，也能从文件读到到底卡在哪一步。
+      const trace = []
+      const diag = (ok) => {
+        try {
+          const body = JSON.stringify({
+            at: new Date().toISOString(),
+            sessionId,
+            ok,
+            hasSessions: !!svc,
+            hasUiWorkspace: !!uiWorkspaceApi,
+            canOpen: !!(uiWorkspaceApi && typeof uiWorkspaceApi.openSession === 'function'),
+            trace,
+          })
+          fetch(`${BASE}/diag`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body,
+          }).catch(() => {})
+        } catch { /* ignore */ }
+      }
+
+      if (!svc || !sessionId) { trace.push('no-svc-or-id'); diag(false); return false }
+
+      // 不是当前主视图 → 不用管
+      let isMain = false
+      try {
+        const info = svc.retainInfo?.(sessionId)?.getSnapshot?.()
+        isMain = (info?.retainedBy?.mainView ?? 0) > 0
+        trace.push(`retainInfo=${JSON.stringify(info?.retainedBy ?? null)}`)
+      } catch (e) {
+        trace.push(`retainInfo-throw:${String(e?.message ?? e)}`)
+        isMain = true
+      }
+      if (!isMain) { trace.push('not-main'); diag(false); return false }
+
+      if (!uiWorkspaceApi) { trace.push('no-uiWorkspace'); diag(false); return false }
+      if (typeof uiWorkspaceApi.openSession !== 'function') {
+        trace.push('no-openSession')
+        diag(false)
+        return false
+      }
+
+      // 找一个「还活着」的会话切过去。
+      // byId 里已经没有刚删掉的这个了（handleSessionRemoved 清掉了），
+      // 顺手排掉子代理，优先给人看得见的真实对话。
+      let nextId = null
+      try {
+        const byId = svc.list?.getSnapshot?.()?.byId ?? {}
+        const candidates = Object.values(byId).filter((row) => {
+          if (!row || !row.id || row.id === sessionId) return false
+          if (row.origin === 'subagent') return false
+          return true
+        })
+        // 优先选「归档集合里没有」的；拿不到归档信息就直接取第一个
+        let archived = new Set()
+        try {
+          // UiWorkspaceService 上持有的是 workspaces（纯 Workspace Controller），
+          // 归档集合在 workspaces.list 的快照里，不是 uiWorkspace.list。
+          const ark = uiWorkspaceApi.workspaces?.list?.getSnapshot?.()?.archivedSessionIds
+          if (Array.isArray(ark)) archived = new Set(ark)
+        } catch { /* ignore */ }
+        const pick = candidates.find((row) => !archived.has(row.id)) ?? candidates[0]
+        nextId = pick?.id ?? null
+        trace.push(`candidates=${candidates.length} archived=${archived.size} pick=${nextId}`)
+      } catch (e) {
+        trace.push(`pick-throw:${String(e?.message ?? e)}`)
+      }
+
+      if (!nextId) {
+        // 一个能切走的都没有（会话全删光了）——只能让面板留空。
+        // 这里不动，交给 DSH 自己处理。
+        trace.push('no-next')
+        diag(false)
+        return false
+      }
+      try {
+        uiWorkspaceApi.openSession(nextId)
+        trace.push('opened')
+        diag(true)
+        return true
+      } catch (e) {
+        trace.push(`open-throw:${String(e?.message ?? e)}`)
+        diag(false)
+        try { console.warn('[dsh-session-guard] 切换主面板失败：', e) } catch { /* ignore */ }
+        return false
+      }
+    }
+
     /** 轮询 state 的 hook：页面可见时才拉，避免后台空转。 */
     function useState_(intervalMs) {
       const [state, setState] = useState(null)
@@ -752,13 +899,22 @@ window.__ModuleLoader__.load({
         setBusy(true)
         try {
           const r = await post('delete', { sessionIds: ids, confirm: true })
+          const n = typeof r?.deleted === 'number' ? r.deleted : 0
           setNotice(
-            `已删除 ${r.deleted} 个会话，释放 ${fmtBytes(r.freedBytes)}。`
+            `已删除 ${n} 个会话，释放 ${fmtBytes(r.freedBytes ?? 0)}。`
             + (r.busy > 0 ? ` ${r.busy} 个因正在运行被跳过。` : '')
             + (r.failed > 0 ? ` ${r.failed} 个失败（备份未成功，已中止）。` : '')
             + ' 需要的话可在「已删除」页恢复。',
           )
           setSelected(new Set())
+          // 让侧边栏把已删的会话从列表移除（不只是刷新本面板）
+          if (n > 0) {
+            for (const id of ids) {
+              // 逐个通知：服务只接受单 id
+              // eslint-disable-next-line no-await-in-loop
+              await guardForgetSession(id)
+            }
+          }
           await refresh()
           await loadBackups()
           await loadRestorable()
@@ -1380,24 +1536,53 @@ window.__ModuleLoader__.load({
     //   2. 删完必须 await sessions.refresh()。本插件直接改文件系统、
     //      绕过了 DSH 服务端，侧边栏的 sessions.list 还是旧快照；
     //      不刷新的话被删的会话会一直留在列表上（要手动刷页面才消失）。
-    function DeleteSessionMenuItem({ sessionId, displayTitle }) {
+    function DeleteSessionMenuItem({ sessionId, displayTitle, useMenuOpenState }) {
       const [busy, setBusy] = useState(false)
+      const [flash, setFlash] = useState(null)
+
+      // 官方的菜单开合 hook（插槽会把它注入 props）。
+      // 官方每个菜单项第一步都是 setMenuOpen(false)——
+      // 不关菜单的话，删除是异步的（要先备份再删，几百毫秒），
+      // 期间界面毫无变化，用户会以为点击没生效。
+      //
+      // Hook 规则：不能写成 `if (typeof useX === 'function') useX()`，
+      // 那样两次渲染的 Hook 数量可能不同，React 会报错。
+      // 所以先填一个占位 hook，保证调用顺序恒定；拿不到就退回 null。
+      const useMenuOpenStateSafe = typeof useMenuOpenState === 'function'
+        ? useMenuOpenState
+        : () => [false, () => {}]
+      const [, setMenuOpen] = useMenuOpenStateSafe()
+      const closeMenu = () => { try { setMenuOpen(false) } catch { /* ignore */ } }
 
       const onDelete = async () => {
         if (busy || !sessionId) return
+        closeMenu()
         setBusy(true)
         try {
           const r = await post('delete', { sessionId, confirm: true })
-          if (r.deleted > 0) {
-            // 让 DSH 重新拉一次会话列表
-            try { await sessionsApi?.refresh?.() } catch { /* 拿不到服务就退化为下次刷新生效 */ }
+          const n = typeof r?.deleted === 'number' ? r.deleted : 0
+          if (n > 0 || r?.alreadyGone) {
+            await guardForgetSession(sessionId)
+            // 如果删的正是当前正在看的那个，把主面板切走。
+            // 必须在 guardForgetSession 之后：那时 byId 已经把它清掉了，
+            // 候选列表里不会又把它选回来。
+            switchAwayIfViewing(sessionId)
+          } else if (r?.dryRun) {
+            setFlash('预演模式：未实际删除')
+          } else if (r?.failed > 0) {
+            setFlash('删除失败：备份未成功，已中止')
+          } else if (r?.archiveFailed > 0) {
+            setFlash('删除失败：会话正在运行或无法从列表移除')
           }
         } catch (e) {
+          setFlash(`删除失败：${e?.message ?? e}`)
           try { console.warn('[dsh-session-guard] 删除会话失败：', e) } catch { /* ignore */ }
         } finally {
           setBusy(false)
         }
       }
+
+      const label = busy ? '删除中…' : (flash ?? '删除会话')
 
       // 优先用官方 MenuItemButton（和「归档会话」等项完全一致）；
       // 万一 primitives 不可用，退回一个最简按钮，至少功能还在。
@@ -1405,7 +1590,7 @@ window.__ModuleLoader__.load({
         return h(primitives.MenuItemButton, {
           icon: TrashIcon ? h(TrashIcon, { size: 14 }) : undefined,
           onSelect: onDelete,
-          children: busy ? '删除中…' : '删除会话',
+          children: label,
         })
       }
 
@@ -1421,7 +1606,7 @@ window.__ModuleLoader__.load({
           cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.6 : 1,
           color: 'var(--dsw-alias-label-primary)', borderRadius: 6,
         },
-      }, busy ? '删除中…' : '删除会话')
+      }, label)
     }
 
     // ---------- 4. 侧边栏入口 ----------
@@ -1474,13 +1659,60 @@ window.__ModuleLoader__.load({
       // 声明在 inject 里，Cordis 会等这个服务就绪再调 apply。
       inject: ['slots', 'sessions'],
       apply(ctx) {
-        // 拿会话服务：删除后要用它的 refresh() 让侧边栏重新拉列表。
-        // 拿不到不影响删除本身，只是列表要等下次刷新才消失。
-        try {
-          sessionsApi = typeof ctx.get === 'function' ? ctx.get('sessions') : null
-        } catch {
-          sessionsApi = null
+        // ---------- 服务获取 ----------
+        //
+        // 关键：uiWorkspace / workspaces 这类服务注册在**客户端 root context** 上
+        // （cordis/lib/index.js:1682 `this.root = self`；ui-workspace 的 apply
+        // 收到的就是 root ctx，然后 super(ctx,"uiWorkspace") 注册到它上面）。
+        // 插件拿到的是子 context，直接 ctx.uiWorkspace 读不到——
+        // Cordis 的代理会顺着 fiber 链往上找，但 isolate 边界会截断。
+        //
+        // 所以统一先试 ctx.root.xxx，再退 ctx.xxx，最后退 ctx.get(name, false)。
+        const rootCtx = (() => {
+          try { return ctx.root || null } catch { return null }
+        })()
+
+        const getService = (name) => {
+          // ① root 上的属性（最可靠）
+          if (rootCtx) {
+            try { if (rootCtx[name]) return rootCtx[name] } catch { /* ignore */ }
+          }
+          // ② 当前 ctx 的属性
+          try { if (ctx[name]) return ctx[name] } catch { /* ignore */ }
+          // ③ 非 strict 的 get（不抛错）
+          try {
+            if (typeof ctx.get === 'function') {
+              const v = ctx.get(name, false)
+              if (v) return v
+            }
+          } catch { /* ignore */ }
+          // ④ root 上的非 strict get
+          try {
+            if (rootCtx && typeof rootCtx.get === 'function') {
+              const v = rootCtx.get(name, false)
+              if (v) return v
+            }
+          } catch { /* ignore */ }
+          return null
         }
+
+        sessionsApi = getService('sessions')
+        uiWorkspaceApi = getService('uiWorkspace')
+
+        // 诊断：把服务实情打到控制台（按 F12 可见）。
+        // 这一步很重要——「没跳转」到底是拿不到服务、还是调了没生效，
+        // 必须从运行时读，不能靠猜。
+        try {
+          console.info('[dsh-session-guard] 服务探测', {
+            hasRoot: !!rootCtx,
+            sessions: !!sessionsApi,
+            uiWorkspace: !!uiWorkspaceApi,
+            canOpenSession: !!(uiWorkspaceApi && typeof uiWorkspaceApi.openSession === 'function'),
+          })
+          if (!uiWorkspaceApi) {
+            console.warn('[dsh-session-guard] ✗ 拿不到 uiWorkspace，删除当前会话后面板会停在那儿')
+          }
+        } catch { /* ignore */ }
 
         // 侧边栏图标区：加折叠开关（纯 CSS 控制显示 + 一个按钮切换）
         //

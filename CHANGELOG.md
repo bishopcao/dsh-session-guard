@@ -2,6 +2,74 @@
 
 All notable changes to this project.
 
+## [1.0.7] — 2026-11-10
+
+### Fixed — 删除后界面三处不同步（这一版彻底解决）
+
+前几版删除会话只做了物理删除，界面和 Host 状态全都停留在旧视图，
+导致三种症状：列表里删不掉、发消息报 ENOENT、主面板停在已删的会话上。
+
+逐个修掉：
+
+**① 侧边栏列表不消失**
+
+DSH 的列表读的是 Host 内存里的会话快照，不是磁盘。直接 `rmSync`
+造成「磁盘已删、Host 仍认为活着」，于是不仅列表删不掉，给那个会话发消息
+还会 `ENOENT: no such file or directory`。
+
+现在删除前先走 DSH 自己的归档通道：
+
+```js
+workspaceRegistry.archiveSession(id)   // 写 archivedSessionIds 并持久化
+rmSync(dir)                            // 再物理删除
+```
+
+顺序不能反——`archiveSession` 内部会校验会话是否还存在
+（`dsh-workspace/lib/index.js:529`），文件删掉之后它会抛
+`WorkspaceUnknownSessionError`。
+
+归档失败就中止删除：宁可删不掉，也不留下 Host 与磁盘不一致的状态。
+
+**② 主面板停在已删的会话上**
+
+`archiveSession` 只摘列表，不动中央面板。原因是主面板用
+`retainedBy.mainView` 引用计数持有会话，那个 reference 握在 UI 组件里，
+服务层没有强制释放的公开接口。
+
+解法是主动切走：
+
+```js
+uiWorkspace.openSession(下一个会话)
+```
+
+切换时旧引用自然释放。判断「是不是当前会话」也走官方口径
+（`retainedBy.mainView > 0`，即 `dsh-client-ui-session/lib/client.js:917`
+判断主视图的依据）。
+
+**③ 服务拿不到**
+
+`uiWorkspace` / `workspaces` 注册在客户端 root context 上，
+插件拿到的是子 context，直接 `ctx.uiWorkspace` 读不到（isolate 边界会截断
+fiber 链的查找）。改成四级获取：`ctx.root` 属性 → `ctx` 属性 →
+`ctx.get(name, false)` → `ctx.root.get(name, false)`。
+
+### Added — 删除决策的诊断回传
+
+排查这类问题时，浏览器控制台往往拿不到。现在 `switchAwayIfViewing`
+每一步都记 trace，通过 `POST /session-guard/diag` 上报，
+后端只在内存留最近 20 条，用 `GET /session-guard/diag` 回读。
+
+trace 会明确落在哪一步：`no-uiWorkspace` / `no-openSession` /
+`not-main` / `no-next` / `open-throw:...` / `opened`。
+
+### Changed — delete.js 三个函数改为 async
+
+`deleteSession` / `deleteSessions` / `deleteSessionsCascade` 都改成 async，
+因为归档是异步的。批量删除改为串行执行——归档走 `operationTail` 队列，
+并发提交会被排队，顺序混乱时也不易定位失败。
+
+新增返回状态 `archive-failed`，与 `backup-failed` 并列。
+
 ## [1.0.2] — 2026-11-09
 
 ### Changed — 文档改为中文为主

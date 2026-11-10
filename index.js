@@ -57,13 +57,30 @@ import {
   backupRoot,
   readIndex,
 } from './backup.js'
-import { deleteSessions, deleteSessionsCascade, descendantsOf } from './delete.js'
+import { deleteSessionsCascade, descendantsOf } from './delete.js'
 
 export const name = 'dsh-session-guard'
 
 // tools  : 注册两个工具
 // webServer: 给 Web UI 提供 /session-guard 接口
+//
+// 注意 workspaceRegistry **不写在这里**：它是可选依赖，
+// 声明进 inject 会让插件在缺少它的宿主上直接起不来。
+// 改成 apply 里 try 抓引用，拿不到就退化为「只删文件」。
 export const inject = ['tools', 'webServer']
+
+/**
+ * DSH 的 Workspace 注册表（可选）。拿到它就能把会话从列表状态里摘掉。
+ *
+ * 为什么需要：DSH 的侧边栏列表读的是 Host 内存里的会话快照，不是磁盘。
+ * 本插件直接 rmSync 会让「磁盘已删、Host 仍认为活着」——界面上删不掉，
+ * 而且给那个会话发消息会 ENOENT（Host 去开一个不存在的文件）。
+ *
+ * workspaceRegistry.archiveSession(id) 是 DSH 自己的归档通道：
+ * 把 id 写进 archivedSessionIds 并持久化，列表立刻过滤掉它。
+ * 这就是「真删除 + 从列表消失」的正解。
+ */
+let workspaceRegistry = null
 
 /** DSH_HOME（默认 ~/.dsh），与其他插件的约定一致。 */
 function dshHome() {
@@ -124,8 +141,31 @@ export function apply(ctx, config = {}) {
   }
 }
 
-function applyInner(ctx, config) {
+function applyInner(ctx, config = {}) {
   const pc = projCacheDir()
+
+  // ---------- 抓取 Workspace 注册表（可选依赖）----------
+  //
+  // archiveSession 走 DSH 自己的归档通道，让「删掉的会话」从侧边栏消失。
+  // 拿不到就退化为只删文件，列表要重启才更新——功能仍在，只是体验差一点。
+  try {
+    workspaceRegistry = ctx.workspaceRegistry || null
+  } catch { workspaceRegistry = null }
+  try {
+    ctx.logger?.info?.(
+      workspaceRegistry
+        ? '[dsh-session-guard] workspaceRegistry 已就绪，删除后会同步从列表移除'
+        : '[dsh-session-guard] 未拿到 workspaceRegistry，删除后需重启 DSH 列表才更新',
+    )
+  } catch { /* ignore */ }
+
+  /** 把会话从 DSH 列表状态里摘掉（归档语义）。拿不到注册表就跳过。 */
+  async function archiveFromList(id) {
+    if (!workspaceRegistry) return   // 退化：只删文件
+    // 不传 stopActivity：会话在跑就让 archiveSession 抛 WorkspaceActiveSessionError，
+    // 我们把它翻译成「正在运行，先停止」。直接强停可能丢正在生成的内容。
+    await workspaceRegistry.archiveSession(id)
+  }
 
   // ---------- 工具 1：查看父子关系 ----------
   ctx.effect(() => ctx.tools.register({
@@ -657,6 +697,11 @@ function applyInner(ctx, config) {
 
   const ROUTE = '/session-guard'
 
+  // 浏览器侧的诊断轨迹（最近 20 条，只在内存里）。
+  // 用途：排查「删了但界面没反应」时，把决策链从浏览器搬到这里，
+  // 免得只能盯着 F12 控制台猜。
+  const diagLog = []
+
   // 结果缓存（问题：UI 每 5 秒轮询 2 个组件，每次都会扫 160+ 个会话文件）
   // 缓存 3 秒：足够让 UI 感觉实时，又把 IO 从 2 次/5秒 降到最多 1 次/3秒。
   const STATE_TTL_MS = 3000
@@ -827,6 +872,13 @@ function applyInner(ctx, config) {
         // ---- 所有 GET 端点必须在 405 判断之前处理 ----
         if (req.method === 'GET') {
           if (action === 'state' || action === '') return json(res, 200, buildState())
+
+          // 诊断回读：浏览器侧把「切换主面板」的决策过程 POST 上来，
+          // 这里原样返回，方便排查「点了删除但界面没反应」。
+          // 只保留最近 20 条，不落盘。
+          if (action === 'diag') {
+            return json(res, 200, { ok: true, items: diagLog.slice(-20) })
+          }
 
           // 数据体检：列出被 scanSessions 静默跳过的会话。
           // 这些通常是磁盘异常、文件损坏、或删到一半留下的残骸，
@@ -1005,6 +1057,22 @@ function applyInner(ctx, config) {
           return json(res, 200, { ok: true, state: buildState(true) })
         }
 
+        // POST /diag：接收浏览器侧的决策轨迹（排查「删除后界面没反应」用）
+        // 只在内存里留最近 20 条，不落盘、不参与业务。
+        if (action === 'diag') {
+          diagLog.push({
+            at: typeof body.at === 'string' ? body.at : new Date().toISOString(),
+            sessionId: body.sessionId ?? null,
+            ok: body.ok === true,
+            hasSessions: body.hasSessions === true,
+            hasUiWorkspace: body.hasUiWorkspace === true,
+            canOpen: body.canOpen === true,
+            trace: Array.isArray(body.trace) ? body.trace.slice(0, 20) : [],
+          })
+          if (diagLog.length > 20) diagLog.splice(0, diagLog.length - 20)
+          return json(res, 200, { ok: true })
+        }
+
         // ---- 备份 / 恢复（POST）----
 
         // POST /backup：立即备份全部会话（UI「立即备份」按钮）
@@ -1137,8 +1205,14 @@ function applyInner(ctx, config) {
           // 级联删除：父会话删了，它的子会话（子代理、fork 分支）也一起删。
           // 否则子代理会变孤儿——DSH 侧边栏不显示它们，用户既看不见也删不掉。
           // body.cascade === false 可关掉（只删指定的那几个）。
+          //
+          // archiveFromList：删除前先把这个会话从 DSH 的列表状态里摘掉。
+          // 顺序不能反——archiveSession 内部会校验会话是否还存在，
+          // 文件删掉之后它就会抛 WorkspaceUnknownSessionError。
           const cascade = body.cascade !== false
-          const r = deleteSessionsCascade(targets, all, { ensureBackup }, { dryRun, cascade })
+          const r = await deleteSessionsCascade(
+            targets, all, { ensureBackup, archive: archiveFromList }, { dryRun, cascade },
+          )
           if (dryRun) {
             return json(res, 200, {
               ok: true,
@@ -1152,6 +1226,14 @@ function applyInner(ctx, config) {
               message: '预演：确认后用 confirm=true 再调用一次才会真正删除。',
             })
           }
+          // 归档失败的结果单独统计：这意味着「文件没删，因为删了列表也摘不掉」
+          const archiveFailed = r.results.filter((x) => x.status === 'archive-failed')
+          if (archiveFailed.length > 0) {
+            ctx.logger?.warn?.(
+              `[dsh-session-guard] ${archiveFailed.length} 个会话因无法从列表移除而中止删除：`
+              + archiveFailed.map((x) => `${x.id}(${x.reason})`).join('; '),
+            )
+          }
           ctx.logger?.info?.(
             `[dsh-session-guard] 已删除 ${r.deleted} 个会话`
             + (r.cascadeDeleted > 0 ? `（其中 ${r.cascadeDeleted} 个是连带删除的子会话）` : '')
@@ -1164,6 +1246,9 @@ function applyInner(ctx, config) {
             freedBytes: r.freedBytes,
             busy: r.busy,
             failed: r.failed,
+            archiveFailed: archiveFailed.length,
+            archiveErrors: archiveFailed.map((x) => ({ id: x.id, reason: x.reason })),
+            listUpdated: !!workspaceRegistry,
             notFound,
             state: buildState(true),
           })

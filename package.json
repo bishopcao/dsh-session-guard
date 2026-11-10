@@ -1,6 +1,6 @@
 {
   "name": "dsh-session-guard",
-  "version": "1.0.2",
+  "version": "1.0.7",
   "description": "防止 DSH 删除父话题时连带删掉子会话；保留增量本地备份，可安全删除与恢复会话。",
   "type": "module",
   "engines": {
